@@ -52,7 +52,7 @@ else:
 # 4. Trigger Logrotate
 # Using dedicated status file to prevent conflicts with daily/system logrotate
 log_info("Triggering logrotate with hourly configuration...")
-res = subprocess.run(["logrotate", "-s", "/var/lib/logrotate/hourly-status", "/etc/logrotate.d/hourly/all-logs"], capture_output=True, text=True)
+res = subprocess.run(["logrotate", "-s", "/var/lib/logrotate/hourly-status", "/etc/logrotate.d/s3-hourly-logs"], capture_output=True, text=True)
 if res.returncode == 0:
     log_info("Logrotate successfully ran.")
 else:
@@ -163,29 +163,3 @@ if os.path.exists(PAYARA_LOG_DIR):
             pass
 
 log_info("KISS hourly log rotation and S3 upload process complete.")
-
-3. scripts/all-logs (Logrotate Config)
-
-# Hourly Logrotate configuration for specific system logs (syslog, auth.log, kern.log)
-# Supported by the hourly upload-s3 cron job.
-
-/var/log/syslog
-/var/log/auth.log
-/var/log/kern.log
-{
-    hourly
-    missingok
-    rotate 168
-    notifempty
-    nocreate
-    nocompress
-    # Use custom date format with SCETMP to identify newly rotated logs before copying/renaming them
-    dateext
-    dateformat -SCETMP-%Y-%m-%d-%H
-    
-    # Send HUP signal to rsyslog so it closes current descriptors and writes to the newly created files
-    sharedscripts
-    postrotate
-        /usr/lib/rsyslog/rsyslog-rotate || systemctl kill -s HUP rsyslog || true
-    endscript
-}
