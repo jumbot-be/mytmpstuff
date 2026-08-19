@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to deploy the Multi-Region CloudWatch Dashboard Lambda function'
+
+Parameters:
+  DashboardName:
+    Type: String
+    Default: 'MultiRegion-Resource-Metrics'
+    Description: 'Base name for the CloudWatch dashboard'
+  
+  DashboardPrefix:
+    Type: String
+    Default: ''
+    Description: 'Optional prefix for the dashboard name'
+  
+  RegionsToMonitor:
+    Type: String
+    Default: ''
+    Description: 'Comma-separated list of AWS regions to monitor. Leave empty to monitor all regions.'
+  
+  LambdaRuntime:
+    Type: String
+    Default: 'python3.12'
+    Description: 'Python runtime version for the Lambda function'
+    AllowedValues: ['python3.9', 'python3.10', 'python3.11', 'python3.12']
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: 'Memory size for the Lambda function in MB'
+    MinValue: 128
+    MaxValue: 10240
+  
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    Description: 'Timeout for the Lambda function in seconds'
+    MinValue: 3
+    MaxValue: 900
+  
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(1 hour)'
+    Description: 'CloudWatch Events schedule expression for Lambda trigger'
+  
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: 'S3 bucket name where Lambda code is stored. If empty, will use CloudFormation package command.'
+  
+  S3KeyPrefix:
+    Type: String
+    Default: 'lambda/cloudwatch-dashboard/'
+    Description: 'S3 key prefix for Lambda code'
+
+Conditions:
+  UseS3Code: !Not [!Equals [!Ref S3BucketName, '']]
+
+Resources:
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      
+      Policies:
+        - PolicyName: CloudWatchDashboardAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:ListDashboards
+                  - cloudwatch:DeleteDashboard
+                Resource: '*'
+        
+        - PolicyName: ResourceDiscoveryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:ListTagsForResource
+                  - efs:DescribeFileSystems
+                  - efs:ListTagsForResource
+                  - efs:DescribeTags
+                  - ec2:DescribeVpnConnections
+                  - ec2:DescribeCustomerGateways
+                  - ec2:DescribeRegions
+                  - ec2:DescribeVpnGateways
+                  - sts:GetCallerIdentity
+                Resource: '*'
+
+  # Lambda Function
+  DashboardLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'CloudWatchDashboardGenerator-${AWS::StackName}'
+      Description: 'Generates a dynamic CloudWatch dashboard with metrics for RDS, EFS, VPN, and IPSEC resources'
+      Runtime: !Ref LambdaRuntime
+      Handler: cloudwatch_dashboard_lambda.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaExecutionRole.Arn
+      
+      Environment:
+        Variables:
+          DASHBOARD_NAME: !Ref DashboardName
+          DASHBOARD_PREFIX: !Ref DashboardPrefix
+          REGIONS: !Ref RegionsToMonitor
+      
+      Code:
+        !If
+          - UseS3Code
+          - S3Bucket: !Ref S3BucketName
+            S3Key: !Sub '${S3KeyPrefix}cloudwatch_dashboard_lambda.zip'
+          - ZipFile: |
+              import json
+              import os
+              
+              def lambda_handler(event, context):
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Please use S3 code deployment or aws cloudformation package command')
+                  }
+
+  # CloudWatch Events Rule to trigger Lambda
+  DashboardUpdateRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'CloudWatchDashboardUpdateRule-${AWS::StackName}'
+      Description: 'Triggers the dashboard update Lambda function'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DashboardLambdaFunction.Arn
+          Id: DashboardLambdaTarget
+
+  # Permission for CloudWatch Events to invoke Lambda
+  DashboardUpdatePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DashboardLambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DashboardUpdateRule.Arn
+
+  # Custom resource to trigger initial dashboard creation
+  InitialDashboardTrigger:
+    Type: Custom::InitialDashboardTrigger
+    Properties:
+      ServiceToken: !GetAtt DashboardLambdaFunction.Arn
+      DashboardName: !Ref DashboardName
+      Regions: !Ref RegionsToMonitor
+
+Outputs:
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function'
+    Value: !GetAtt DashboardLambdaFunction.Arn
+  
+  LambdaFunctionName:
+    Description: 'Name of the Lambda function'
+    Value: !Ref DashboardLambdaFunction
+  
+  DashboardName:
+    Description: 'Name of the CloudWatch dashboard that will be created'
+    Value: !Sub '${DashboardPrefix}-${DashboardName}-${AWS::AccountId}'
+  
+  CloudWatchEventsRuleArn:
+    Description: 'ARN of the CloudWatch Events rule'
+    Value: !GetAtt DashboardUpdateRule.Arn
+  
+  LambdaExecutionRoleArn:
+    Description: 'ARN of the Lambda execution role'
+    Value: !GetAtt LambdaExecutionRole.Arn
