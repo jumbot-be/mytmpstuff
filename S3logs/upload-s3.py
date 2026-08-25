@@ -77,29 +77,66 @@ for file_path in glob.glob(os.path.join(LOG_DIR, "*-SCETMP-*")):
         except Exception as e:
             log_error(f"Failed to stage system log file: {filename}. Error: {e}")
 
-# 6. Locate & Stage Payara / Logback Logs
-# Payara active logs are apcm.log, apcm-debug.log, apcm.logs, apcm-debug.logs
-# We process already rotated logs (which contain rotation/date suffixes)
-if os.path.exists(PAYARA_LOG_DIR):
-    log_info(f"Scanning for rotated Payara logs in {PAYARA_LOG_DIR}...")
-    for file_path in glob.glob(os.path.join(PAYARA_LOG_DIR, "apcm*")):
+# 5b. Locate & Stage Nginx Logs
+NGINX_LOG_DIR = "/var/log/nginx"
+if os.path.exists(NGINX_LOG_DIR):
+    log_info(f"Scanning for newly rotated nginx logs in {NGINX_LOG_DIR}...")
+    for file_path in glob.glob(os.path.join(NGINX_LOG_DIR, "*-SCETMP-*")):
         if os.path.isfile(file_path):
             filename = os.path.basename(file_path)
+            logsource = filename.split("-SCETMP-")[0]
+            target_filename = filename.replace("-SCETMP-", "-SCE-")
             
-            # Skip active logs
-            if filename in ["apcm.log", "apcm-debug.log", "apcm.logs", "apcm-debug.logs"]:
-                continue
-            
-            # Skip already processed logs
-            if filename.endswith(".uploaded"):
-                continue
-            
-            log_info(f"Staging Payara log: {filename}")
+            log_info(f"Staging nginx log: {filename} -> {target_filename}")
             try:
-                shutil.copy(file_path, os.path.join(STAGING_DIR, filename))
-                os.rename(file_path, file_path + ".uploaded")
+                shutil.copy(file_path, os.path.join(STAGING_DIR, target_filename))
+                os.rename(file_path, os.path.join(NGINX_LOG_DIR, target_filename))
             except Exception as e:
-                log_error(f"Failed to stage Payara log file: {filename}. Error: {e}")
+                log_error(f"Failed to stage nginx log file: {filename}. Error: {e}")
+
+# 5c. Locate & Stage CrushFTP Logs
+CRUSH_FTP_LOG_DIR = "/opt/CrushFTP11"
+if os.path.exists(CRUSH_FTP_LOG_DIR):
+    log_info(f"Scanning for newly rotated CrushFTP logs in {CRUSH_FTP_LOG_DIR}...")
+    for file_path in glob.glob(os.path.join(CRUSH_FTP_LOG_DIR, "*-SCETMP-*")):
+        if os.path.isfile(file_path):
+            filename = os.path.basename(file_path)
+            logsource = filename.split("-SCETMP-")[0]
+            target_filename = filename.replace("-SCETMP-", "-SCE-")
+            
+            log_info(f"Staging CrushFTP log: {filename} -> {target_filename}")
+            try:
+                shutil.copy(file_path, os.path.join(STAGING_DIR, target_filename))
+                os.rename(file_path, os.path.join(CRUSH_FTP_LOG_DIR, target_filename))
+            except Exception as e:
+                log_error(f"Failed to stage CrushFTP log file: {filename}. Error: {e}")
+
+# 6. Locate & Stage Payara / Logback Logs
+# Payara rotated logs follow patterns: adr-YYYY-MM-DD-HH.log, adr-audit-YYYY-MM-DD-HH.log, etc.
+if os.path.exists(PAYARA_LOG_DIR):
+    log_info(f"Scanning for Payara logs from the current hour in {PAYARA_LOG_DIR}...")
+    
+    # Get current hour pattern: YYYY-MM-DD-HH
+    current_hour = datetime.now().strftime('%Y-%m-%d-%H')
+    
+    # Match files rotated this hour
+    patterns = [
+        f"adr-{current_hour}.log",
+        f"adr-audit-{current_hour}.log",
+        f"ampacimon-{current_hour}.log",
+        f"ampacimon-debug-{current_hour}.log.zip",
+        f"ampacimon-audit-{current_hour}.log",
+        f"sce-ampacimon-{current_hour}.log"
+    ]
+    
+    for pattern in patterns:
+        file_path = os.path.join(PAYARA_LOG_DIR, pattern)
+        if os.path.isfile(file_path):
+            log_info(f"Staging Payara log: {pattern}")
+            try:
+                shutil.copy(file_path, os.path.join(STAGING_DIR, pattern))
+            except Exception as e:
+                log_error(f"Failed to stage Payara log file: {pattern}. Error: {e}")
 else:
     log_info(f"Payara log directory {PAYARA_LOG_DIR} does not exist. Skipping Payara log scanning.")
 
@@ -153,13 +190,6 @@ for file_path in glob.glob(os.path.join(LOG_DIR, "*-SCE-*")):
     except Exception:
         pass
 
-# Clean up processed Payara logs older than 7 days
-if os.path.exists(PAYARA_LOG_DIR):
-    for file_path in glob.glob(os.path.join(PAYARA_LOG_DIR, "*.uploaded")):
-        try:
-            if os.path.isfile(file_path) and (now_ts - os.path.getmtime(file_path)) > seven_days_sec:
-                os.remove(file_path)
-        except Exception:
-            pass
+
 
 log_info("KISS hourly log rotation and S3 upload process complete.")

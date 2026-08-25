@@ -1,0 +1,20 @@
+/var/log/syslog
+/var/log/auth.log
+/var/log/kern.log
+{
+    hourly
+    missingok
+    rotate 168
+    notifempty
+    nocreate
+    nocompress
+    # Use custom date format with SCETMP to identify newly rotated logs before copying/renaming them
+    dateext
+    dateformat -SCETMP-%Y-%m-%d-%H
+    
+    # Send HUP signal to rsyslog so it closes current descriptors and writes to the newly created files
+    sharedscripts
+    postrotate
+        /usr/lib/rsyslog/rsyslog-rotate || systemctl kill -s HUP rsyslog || true
+    endscript
+}
