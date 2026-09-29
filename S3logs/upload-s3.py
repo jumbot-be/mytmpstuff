@@ -9,8 +9,12 @@ import re
 import glob
 import shutil
 import socket
+import argparse
 import subprocess
 from datetime import datetime, timedelta
+
+# Global verbose flag
+VERBOSE = False
 
 # 1. Configuration
 BUCKET_NAME = os.environ.get("S3_LOG_BUCKET", "sdt-be-adr-dev-audit-logs")
@@ -20,19 +24,19 @@ STAGING_DIR = "/var/spool/s3-upload"
 SOURCES_CONFIG = [
     {
         "logsource": "syslog",
-        "patterns": ["/var/log/syslog"]
+        "patterns": ["/var/log/syslog*"]
     },
     {
         "logsource": "auth.log",
-        "patterns": ["/var/log/auth.log"]
+        "patterns": ["/var/log/auth.log*"]
     },
     {
         "logsource": "kern.log",
-        "patterns": ["/var/log/kern.log"]
+        "patterns": ["/var/log/kern.log*"]
     },
     {
         "logsource": "nginx",
-        "patterns": ["/var/log/nginx/*.log"]
+        "patterns": ["/var/log/nginx/*"]
     },
     {
         "logsource": "crushftp",
@@ -40,11 +44,11 @@ SOURCES_CONFIG = [
     },
     {
         "logsource": "keycloak",
-        "patterns": ["/opt/adr/apcm-keycloak-bundle-rh/keycloak/data/log/*.log"]
+        "patterns": ["/opt/adr/apcm-keycloak-bundle-rh/keycloak/data/log/*"]
     },
     {
         "logsource": "ADR",
-        "patterns": ["/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs/*.log"]
+        "patterns": ["/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs/*"]
     }
 ]
 
@@ -60,6 +64,11 @@ def log_info(msg):
     print(f"[{timestamp}] INFO: {msg}")
     subprocess.run(["logger", "-t", "upload-s3", f"INFO: {msg}"], check=False)
 
+def log_debug(msg):
+    if VERBOSE:
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        print(f"[{timestamp}] DEBUG: {msg}")
+
 def log_error(msg):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     print(f"[{timestamp}] ERROR: {msg}", file=sys.stderr)
@@ -71,7 +80,7 @@ TIMESTAMP_PATTERNS = [
     (re.compile(r'(?:^|\[)(\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2})(?:[.,]\d+)?'),
      ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y/%m/%d %H:%M:%S']),
 
-    # Nginx combined / common log format: [30/Mar/2026:14:05:01 +0000]
+    # Nginx combined / common log format: [30/Mar/2026:14:05:01 +0000] or [29/Sep/2026:13:07:13 +0000]
     (re.compile(r'\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2})'),
      ['%d/%b/%Y:%H:%M:%S']),
 
@@ -111,29 +120,43 @@ def extract_logs_for_target_hour(file_path, start_time, end_time):
     """
     extracted_lines = []
     current_entry_in_range = False
+    total_lines = 0
 
     try:
         with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
+                total_lines += 1
                 dt = parse_line_timestamp(line, reference_year=start_time.year)
                 if dt is not None:
-                    # New log entry with timestamp
                     if start_time <= dt <= end_time:
                         current_entry_in_range = True
                         extracted_lines.append(line)
+                        log_debug(f"Matched line: {dt} | {line.strip()[:80]}")
                     else:
                         current_entry_in_range = False
+                        log_debug(f"Out-of-range timestamp: {dt} | {line.strip()[:80]}")
                 else:
-                    # Multi-line continuation
                     if current_entry_in_range:
                         extracted_lines.append(line)
+                        log_debug(f"Matched continuation line | {line.strip()[:80]}")
     except Exception as e:
         log_error(f"Error reading file {file_path}: {e}")
 
+    log_debug(f"Processed {total_lines} lines from {file_path}, extracted {len(extracted_lines)} lines.")
     return extracted_lines
 
 def main():
+    global VERBOSE
+    parser = argparse.ArgumentParser(description="Hourly S3 log extraction and upload script")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose / debug output")
+    args = parser.parse_args()
+
+    if args.verbose:
+        VERBOSE = True
+
     log_info(f"Starting hourly S3 log extraction and upload process on {SERVER_NAME}.")
+    if VERBOSE:
+        log_info("Verbose mode enabled.")
 
     # Environment check
     if not shutil.which("aws"):
@@ -162,6 +185,7 @@ def main():
 
     def stage_extracted_content(basename, logsource, lines):
         if not lines:
+            log_debug(f"No extracted lines for {basename} [{logsource}]. Skipping staging.")
             return
         
         target_filename = f"{basename}-{target_hour_str}.log"
@@ -169,7 +193,7 @@ def main():
 
         log_info(f"Staging extracted logs [{logsource}]: {target_filename} ({len(lines)} lines)")
         try:
-            with open(dest_path, 'w', encoding='utf-8') as f:
+            with open(dest_path, 'a', encoding='utf-8') as f:
                 f.writelines(lines)
             if dest_path not in staged_paths:
                 staged_items.append((dest_path, logsource))
@@ -182,11 +206,11 @@ def main():
         logsource = source["logsource"]
         for pattern in source["patterns"]:
             matched_files = glob.glob(pattern)
+            log_debug(f"Pattern '{pattern}' matched {len(matched_files)} files.")
             for file_path in matched_files:
                 if not os.path.isfile(file_path):
                     continue
                 filename = os.path.basename(file_path)
-                # derive base name without extension for clean output file naming
                 base_name, _ = os.path.splitext(filename)
 
                 log_info(f"Extracting logs from {file_path} for logsource {logsource}...")
@@ -201,7 +225,7 @@ def main():
             filename = os.path.basename(f)
             if filename.startswith(("syslog", "auth", "kern")):
                 ls = "auth.log" if filename.startswith("auth") else ("kern.log" if filename.startswith("kern") else "syslog")
-            elif "nginx" in filename:
+            elif "nginx" in filename or "access" in filename or "error" in filename:
                 ls = "nginx"
             elif "crushftp" in filename:
                 ls = "crushftp"

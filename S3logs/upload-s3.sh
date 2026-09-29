@@ -5,6 +5,16 @@
 
 set -eo pipefail
 
+# Parse CLI flags
+VERBOSE=0
+for arg in "$@"; do
+    case "$arg" in
+        -v|--verbose)
+            VERBOSE=1
+            ;;
+    esac
+done
+
 # 1. Configuration
 BUCKET_NAME="${S3_LOG_BUCKET:-sdt-be-adr-dev-audit-logs}"
 STAGING_DIR="/var/spool/s3-upload"
@@ -19,6 +29,15 @@ log_info() {
     logger -t "upload-s3" "INFO: $msg" 2>/dev/null || true
 }
 
+log_debug() {
+    if [ "$VERBOSE" -eq 1 ]; then
+        local msg="$1"
+        local timestamp
+        timestamp="$(date +'%Y-%m-%d %H:%M:%S')"
+        echo "[$timestamp] DEBUG: $msg"
+    fi
+}
+
 log_error() {
     local msg="$1"
     local timestamp
@@ -28,6 +47,9 @@ log_error() {
 }
 
 log_info "Starting hourly S3 log extraction and upload process on ${SERVER_NAME} (Bash/AWK)."
+if [ "$VERBOSE" -eq 1 ]; then
+    log_info "Verbose mode enabled."
+fi
 
 # Environment Checks
 if ! command -v aws >/dev/null 2>&1; then
@@ -59,13 +81,13 @@ BEGIN {
     in_target = 0;
 }
 
-function parse_dt(line,   mon, day) {
+function parse_dt(line,   mon, day, idx, str) {
     # 1) ISO / Standard: 2026-03-30 14:05:01, 2026/03/30 14:05:01, 2026-03-30T14:05:01
     if (line ~ /(^|\[)[0-9]{4}[-\/][0-9]{2}[-\/][0-9]{2}[T ][0-9]{2}:[0-9]{2}:[0-9]{2}/) {
         gsub(/^[ \t]*\[?/, "", line);
         return substr(line, 1, 4) "-" substr(line, 6, 2) "-" substr(line, 9, 2) "-" substr(line, 12, 2);
     }
-    # 2) Nginx: [30/Mar/2026:14:05:01
+    # 2) Nginx: [30/Mar/2026:14:05:01 +0000] or [29/Sep/2026:13:07:13 +0000]
     if (line ~ /\[[0-9]{2}\/[A-Za-z]{3}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/) {
         idx = index(line, "[");
         str = substr(line, idx + 1);
@@ -103,6 +125,14 @@ function parse_dt(line,   mon, day) {
 }
 EOF
 
+STAGED_MANIFEST="${STAGING_DIR}/.staged_manifest"
+
+stage_item() {
+    local file_path="$1"
+    local logsource="$2"
+    echo "${file_path}|${logsource}" >> "$STAGED_MANIFEST"
+}
+
 process_source() {
     local logsource="$1"
     shift
@@ -113,6 +143,8 @@ process_source() {
         local files=($pattern)
         shopt -u nullglob
 
+        log_debug "Pattern '$pattern' matched ${#files[@]} files."
+
         for file_path in "${files[@]}"; do
             [ -f "$file_path" ] || continue
             local filename
@@ -121,15 +153,20 @@ process_source() {
             local target_filename="${base_name}-${TARGET_TAG}.log"
             local dest_path="${STAGING_DIR}/${target_filename}"
 
+            log_info "Extracting logs from ${file_path} for logsource ${logsource}..."
+
             local tmp_out
             tmp_out="$(mktemp "${STAGING_DIR}/tmp.XXXXXX")"
 
             awk -v target_year="$TARGET_YEAR" -v target_tag="$TARGET_TAG" "$AWK_EXTRACTOR" "$file_path" > "$tmp_out" || true
 
             if [ -s "$tmp_out" ]; then
-                mv "$tmp_out" "$dest_path"
+                cat "$tmp_out" >> "$dest_path"
+                stage_item "$dest_path" "$logsource"
                 log_info "Staged extracted logs [${logsource}]: ${target_filename}"
+                rm -f "$tmp_out"
             else
+                log_debug "No matching lines extracted from ${file_path}."
                 rm -f "$tmp_out"
             fi
         done
@@ -138,52 +175,32 @@ process_source() {
 
 # Process monitored sources
 log_info "Extracting system logs..."
-process_source "syslog" "/var/log/syslog"
-process_source "auth.log" "/var/log/auth.log"
-process_source "kern.log" "/var/log/kern.log"
+process_source "syslog" "/var/log/syslog*"
+process_source "auth.log" "/var/log/auth.log*"
+process_source "kern.log" "/var/log/kern.log*"
 
 log_info "Extracting Nginx logs..."
-process_source "nginx" "/var/log/nginx/*.log"
+process_source "nginx" "/var/log/nginx/*"
 
 log_info "Extracting CrushFTP logs..."
 process_source "crushftp" "/opt/CrushFTP11/*.log"
 
 log_info "Extracting Keycloak logs..."
-process_source "keycloak" "/opt/adr/apcm-keycloak-bundle-rh/keycloak/data/log/*.log"
+process_source "keycloak" "/opt/adr/apcm-keycloak-bundle-rh/keycloak/data/log/*"
 
 log_info "Extracting Payara logs..."
-process_source "ADR" "/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs/*.log"
+process_source "ADR" "/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs/*"
 
 # Upload Staged Files to S3
 log_info "Starting uploads from ${STAGING_DIR} to S3 bucket ${BUCKET_NAME}..."
 
-shopt -s nullglob
-staged_files=("${STAGING_DIR}"/*.log)
-shopt -u nullglob
-
-if [ ${#staged_files[@]} -eq 0 ]; then
+if [ ! -f "$STAGED_MANIFEST" ] || [ ! -s "$STAGED_MANIFEST" ]; then
     log_info "No files staged for S3 upload."
 else
-    for file_path in "${staged_files[@]}"; do
+    # Read unique staged items from manifest
+    sort -u "$STAGED_MANIFEST" | while IFS='|' read -r file_path logsource; do
         [ -f "$file_path" ] || continue
         filename="$(basename "$file_path")"
-
-        logsource="general"
-        if [[ "$filename" == syslog* ]]; then
-            logsource="syslog"
-        elif [[ "$filename" == auth* ]]; then
-            logsource="auth.log"
-        elif [[ "$filename" == kern* ]]; then
-            logsource="kern.log"
-        elif [[ "$filename" == *nginx* || "$filename" == access* || "$filename" == error* ]]; then
-            logsource="nginx"
-        elif [[ "$filename" == *crushftp* ]]; then
-            logsource="crushftp"
-        elif [[ "$filename" == *keycloak* ]]; then
-            logsource="keycloak"
-        elif [[ "$filename" == *adr* || "$filename" == *ampacimon* || "$filename" == *sce* || "$filename" == *server* ]]; then
-            logsource="ADR"
-        fi
 
         s3_uri="s3://${BUCKET_NAME}/logs/${SERVER_NAME}/${logsource}/${filename}"
         log_info "Uploading ${filename} to ${s3_uri}"
@@ -195,6 +212,7 @@ else
             log_error "Failed to upload ${filename} to S3. Retaining local staged file for retry."
         fi
     done
+    rm -f "$STAGED_MANIFEST"
 fi
 
 log_info "Hourly log extraction and S3 upload process complete (Bash/AWK)."
