@@ -11,7 +11,7 @@ import shutil
 import socket
 import argparse
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # Global verbose flag
 VERBOSE = False
@@ -63,17 +63,17 @@ except Exception:
 
 # 2. Logging Helpers
 def log_info(msg):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     print(f"[{timestamp}] INFO: {msg}")
     subprocess.run(["logger", "-t", "upload-s3", f"INFO: {msg}"], check=False)
 
 def log_debug(msg):
     if VERBOSE:
-        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         print(f"[{timestamp}] DEBUG: {msg}")
 
 def log_error(msg):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
     print(f"[{timestamp}] ERROR: {msg}", file=sys.stderr)
     subprocess.run(["logger", "-t", "upload-s3", f"ERROR: {msg}"], check=False)
 
@@ -94,7 +94,7 @@ TIMESTAMP_PATTERNS = [
 
 def parse_line_timestamp(line, reference_year=None):
     if reference_year is None:
-        reference_year = datetime.now().year
+        reference_year = datetime.now(timezone.utc).year
 
     for regex, fmt_list in TIMESTAMP_PATTERNS:
         m = regex.search(line)
@@ -158,16 +158,15 @@ def main():
     else:
         os.chmod(STAGING_DIR, 0o700)
 
-    # Determine target hour window: the previous full clock hour
-    now = datetime.now()
-    # If run at e.g. 14:19:56, target_dt is 13:00 (previous full clock hour)
-    target_dt = (now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
+    # Determine target hour window in UTC: previous full clock hour
+    now_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+    target_dt = (now_utc.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
     target_hour_str = target_dt.strftime("%Y-%m-%d-%H")
 
     start_time = target_dt
     end_time = target_dt.replace(minute=59, second=59, microsecond=999999)
 
-    log_info(f"Target extraction window: {start_time} to {end_time} (Hour tag: {target_hour_str})")
+    log_info(f"Target extraction window (UTC): {start_time} to {end_time} (Hour tag: {target_hour_str})")
 
     staged_items = []
     staged_paths = set()
@@ -189,7 +188,7 @@ def main():
         except Exception as e:
             log_error(f"Failed to write staged log file: {target_filename}. Error: {e}")
 
-    # Candidate file mtime must be >= start_time - 300 seconds
+    # Candidate file mtime check (start_time minus 5 min buffer in epoch seconds)
     min_mtime = start_time.timestamp() - 300
 
     for source in SOURCES_CONFIG:

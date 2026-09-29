@@ -24,7 +24,7 @@ SERVER_NAME="$(hostname 2>/dev/null || echo "unknown-host")"
 log_info() {
     local msg="$1"
     local timestamp
-    timestamp="$(date +'%Y-%m-%d %H:%M:%S')"
+    timestamp="$(TZ=UTC date +'%Y-%m-%d %H:%M:%S UTC')"
     echo "[$timestamp] INFO: $msg"
     logger -t "upload-s3" "INFO: $msg" 2>/dev/null || true
 }
@@ -33,7 +33,7 @@ log_debug() {
     if [ "$VERBOSE" -eq 1 ]; then
         local msg="$1"
         local timestamp
-        timestamp="$(date +'%Y-%m-%d %H:%M:%S')"
+        timestamp="$(TZ=UTC date +'%Y-%m-%d %H:%M:%S UTC')"
         echo "[$timestamp] DEBUG: $msg"
     fi
 }
@@ -41,7 +41,7 @@ log_debug() {
 log_error() {
     local msg="$1"
     local timestamp
-    timestamp="$(date +'%Y-%m-%d %H:%M:%S')"
+    timestamp="$(TZ=UTC date +'%Y-%m-%d %H:%M:%S UTC')"
     echo "[$timestamp] ERROR: $msg" >&2
     logger -t "upload-s3" "ERROR: $msg" 2>/dev/null || true
 }
@@ -66,16 +66,15 @@ else
     chmod 700 "$STAGING_DIR"
 fi
 
-# Calculate target extraction hour (previous full clock hour)
-CURRENT_CLOCK_HOUR="$(date +'%Y-%m-%d %H:00:00')"
-TARGET_TAG="$(date -d "$CURRENT_CLOCK_HOUR - 1 hour" +'%Y-%m-%d-%H')"
-TARGET_YEAR="$(date -d "$CURRENT_CLOCK_HOUR - 1 hour" +'%Y')"
+# Calculate target extraction hour in UTC (previous full clock hour)
+TARGET_TAG="$(TZ=UTC date -d '1 hour ago' +'%Y-%m-%d-%H')"
+TARGET_YEAR="$(TZ=UTC date -d '1 hour ago' +'%Y')"
 
 # Minimum mtime in epoch seconds (target hour start minus 5 min buffer)
-MIN_MTIME_EPOCH="$(date -d "$CURRENT_CLOCK_HOUR - 1 hour" +'%Y-%m-%d %H:00:00')"
-MIN_MTIME_SEC="$(date -d "$MIN_MTIME_EPOCH - 5 minutes" +%s)"
+TARGET_HOUR_START_UTC="$(TZ=UTC date -d '1 hour ago' +'%Y-%m-%d %H:00:00 UTC')"
+MIN_MTIME_SEC="$(TZ=UTC date -d "$TARGET_HOUR_START_UTC - 5 minutes" +%s)"
 
-log_info "Target extraction hour tag: ${TARGET_TAG}"
+log_info "Target extraction hour tag (UTC): ${TARGET_TAG}"
 
 # Embedded AWK extractor script (POSIX AWK compatible)
 read -r -d '' AWK_EXTRACTOR << 'EOF' || true
