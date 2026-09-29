@@ -1,24 +1,22 @@
-# KISS Log Rotation - Hourly to S3: Deployment & Architecture Guide
+# Direct Hourly Log Extraction & S3 Upload Guide
 
-This document provides the deployment instructions, architecture notes, and system integration steps for the hourly log rotation and Amazon S3 upload process.
+This document provides deployment instructions, architecture notes, and system integration steps for the direct timestamp-based hourly log extraction and Amazon S3 upload process.
 
 ---
 
-## 1. System Conffiles & Avoiding Daily vs. Hourly Conflicts
+## 1. Direct Timestamp Extraction Overview
 
-To prevent conflicts between standard daily log rotation (e.g. `/etc/logrotate.d/rsyslog` or `/etc/logrotate.d/nginx`) and the hourly rotation required for S3 upload:
+The `upload-s3.py` script directly parses standard log files line by line, identifies timestamps, and extracts all log entries corresponding to the **previous full hour** (e.g. from `14:00:00` to `14:59:59` when run at `15:00`).
 
-1. **Standard `conffile` Customization:**
-   Debian/Ubuntu package managers treat files under `/etc/logrotate.d/` as `conffiles`. By directly updating `/etc/logrotate.d/rsyslog` and `/etc/logrotate.d/nginx` with hourly rotation directives (`hourly`, `dateext`, `dateformat -%Y-%m-%d-%H`), package updates via `apt upgrade` will preserve your custom configuration instead of overwriting it.
-
-2. **Unified Logrotate Invocation:**
-   The `upload-s3.py` script calls `logrotate /etc/logrotate.d/s3-hourly-logs` using the standard system logrotate status file (`/var/lib/logrotate/status`), eliminating state file divergence or collisions.
+- **No System `logrotate` Dependency:** The script operates without modifying standard system logrotate configurations or triggering external rotation commands.
+- **Multi-line Log Support:** Secondary lines (such as Java stack traces in Keycloak or Payara) that do not begin with a timestamp are automatically associated with the timestamp of their parent entry.
+- **Staging Filename Format:** Extracted lines are written to `/var/spool/s3-upload/<basename>-<YYYY-MM-DD-HH>.log` before being uploaded to S3.
 
 ---
 
 ## 2. System Cron Setup
 
-The `upload-s3.py` script should be executed on an hourly schedule.
+The `upload-s3.py` script should be executed on an hourly schedule (ideally at minute 0).
 
 Deploy a cron job under `/etc/cron.d/upload-s3`:
 
@@ -38,20 +36,20 @@ sudo chmod +x /etc/cron.hourly/upload-s3
 
 ## 3. Monitored Log Directories & S3 Destination Mapping
 
-The script monitors the following directories and uploads newly rotated files (modified within the last 3600 seconds) to S3 under `s3://<bucket>/logs/<hostname>/<logsource>/<filename>`:
+The script monitors the following log files and extracts the previous hour's logs to `s3://<bucket>/logs/<hostname>/<logsource>/<filename>`:
 
-| Log Type | Source Directory | Selection Pattern | S3 Logsource Category |
-| :--- | :--- | :--- | :--- |
-| **System Logs** | `/var/log/` | `syslog-*`, `auth.log-*`, `kern.log-*` | `syslog`, `auth.log`, `kern.log` |
-| **Nginx Logs** | `/var/log/nginx/` | `*.log-*` | `nginx` |
-| **CrushFTP Logs** | `/opt/CrushFTP11/` | `*.log-*` | `crushftp` |
-| **Keycloak Logs** | `/opt/adr/apcm-keycloak-bundle-rh/keycloak/data/log/` | `*` (except active `keycloak.log`) | `keycloak` |
-| **Payara / ADR Logs** | `/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs/` | `*` (except active `.log` files) | `ADR` |
+| Log Type | Source File Pattern | S3 Logsource Category |
+| :--- | :--- | :--- |
+| **System Logs** | `/var/log/syslog`, `/var/log/auth.log`, `/var/log/kern.log` | `syslog`, `auth.log`, `kern.log` |
+| **Nginx Logs** | `/var/log/nginx/*.log` | `nginx` |
+| **CrushFTP Logs** | `/opt/CrushFTP11/*.log` | `crushftp` |
+| **Keycloak Logs** | `/opt/adr/apcm-keycloak-bundle-rh/keycloak/data/log/*.log` | `keycloak` |
+| **Payara / ADR Logs** | `/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs/*.log` | `ADR` |
 
 ---
 
-## 4. Safety & Retention Principles
+## 4. Safety & Data Retention Principles
 
-- **No Renaming of Original Logs:** Original rotated logs remain untouched in their source directories to allow standard retention (`rotate 168` / Logback `maxHistory 168`) to manage local cleanup automatically.
-- **Secure Staging Area:** Files are copied to `/var/spool/s3-upload` with `0700` (`root:root`) permissions before upload.
-- **Data Protection:** Staged files are removed from local staging **only** after the `aws s3 cp` command returns exit code `0` (success). If an upload fails, the staged file is retained for retry during subsequent runs.
+- **Zero Modification to Original Logs:** Original active log files are never renamed, truncated, or rotated by this script.
+- **Secure Staging Area:** Files are written to `/var/spool/s3-upload` with `0700` (`root:root`) permissions before upload.
+- **Reliable Upload Cleanup:** Staged files are removed from local staging **only** after the `aws s3 cp` command returns exit code `0` (success). If an upload fails, the staged file is retained for retry during subsequent runs.
