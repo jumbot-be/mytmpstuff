@@ -52,6 +52,9 @@ SOURCES_CONFIG = [
     }
 ]
 
+# Extensions to skip (compressed, temporary, or non-text files)
+SKIP_EXTENSIONS = ('.gz', '.bz2', '.xz', '.zip', '.tar', 'tmp', 'TMP', '.swp')
+
 # Server hostname
 try:
     SERVER_NAME = socket.gethostname()
@@ -80,7 +83,7 @@ TIMESTAMP_PATTERNS = [
     (re.compile(r'(?:^|\[)(\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2})(?:[.,]\d+)?'),
      ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y/%m/%d %H:%M:%S']),
 
-    # Nginx combined / common log format: [30/Mar/2026:14:05:01 +0000] or [29/Sep/2026:13:07:13 +0000]
+    # Nginx combined / common log format: [30/Mar/2026:14:05:01 +0000]
     (re.compile(r'\[(\d{2}/[A-Za-z]{3}/\d{4}:\d{2}:\d{2}:\d{2})'),
      ['%d/%b/%Y:%H:%M:%S']),
 
@@ -90,10 +93,6 @@ TIMESTAMP_PATTERNS = [
 ]
 
 def parse_line_timestamp(line, reference_year=None):
-    """
-    Parses a timestamp from a log line.
-    Returns datetime object if successfully parsed, or None.
-    """
     if reference_year is None:
         reference_year = datetime.now().year
 
@@ -112,12 +111,6 @@ def parse_line_timestamp(line, reference_year=None):
     return None
 
 def extract_logs_for_target_hour(file_path, start_time, end_time):
-    """
-    Reads a log file line by line and extracts lines whose timestamps
-    fall within [start_time, end_time].
-    Supports multi-line log entries (e.g., stack traces) by attaching
-    continuation lines to the timestamp of the preceding entry.
-    """
     extracted_lines = []
     current_entry_in_range = False
     total_lines = 0
@@ -134,7 +127,6 @@ def extract_logs_for_target_hour(file_path, start_time, end_time):
                         log_debug(f"Matched line: {dt} | {line.strip()[:80]}")
                     else:
                         current_entry_in_range = False
-                        log_debug(f"Out-of-range timestamp: {dt} | {line.strip()[:80]}")
                 else:
                     if current_entry_in_range:
                         extracted_lines.append(line)
@@ -155,22 +147,17 @@ def main():
         VERBOSE = True
 
     log_info(f"Starting hourly S3 log extraction and upload process on {SERVER_NAME}.")
-    if VERBOSE:
-        log_info("Verbose mode enabled.")
 
-    # Environment check
     if not shutil.which("aws"):
         log_error("AWS CLI (aws) is not installed or not in PATH. Aborting.")
         sys.exit(1)
 
-    # Ensure secure staging directory exists with root-only permissions (700)
     if not os.path.exists(STAGING_DIR):
         os.makedirs(STAGING_DIR, mode=0o700)
         log_info(f"Created secure staging directory at {STAGING_DIR} with 700 permissions.")
     else:
         os.chmod(STAGING_DIR, 0o700)
 
-    # Determine target hour: the previous full hour
     now = datetime.now()
     target_dt = now - timedelta(hours=1)
     target_hour_str = target_dt.strftime("%Y-%m-%d-%H")
@@ -185,7 +172,6 @@ def main():
 
     def stage_extracted_content(basename, logsource, lines):
         if not lines:
-            log_debug(f"No extracted lines for {basename} [{logsource}]. Skipping staging.")
             return
         
         target_filename = f"{basename}-{target_hour_str}.log"
@@ -201,23 +187,38 @@ def main():
         except Exception as e:
             log_error(f"Failed to write staged log file: {target_filename}. Error: {e}")
 
-    # Extract logs for all configured sources
+    min_mtime = start_time.timestamp() - 300  # allow 5 min buffer
+
     for source in SOURCES_CONFIG:
         logsource = source["logsource"]
         for pattern in source["patterns"]:
             matched_files = glob.glob(pattern)
-            log_debug(f"Pattern '{pattern}' matched {len(matched_files)} files.")
             for file_path in matched_files:
                 if not os.path.isfile(file_path):
                     continue
+
+                # Skip compressed or temporary extensions
+                if file_path.endswith(SKIP_EXTENSIONS):
+                    log_debug(f"Skipping compressed/temp file: {file_path}")
+                    continue
+
+                # Filter by file modification time (mtime)
+                try:
+                    file_mtime = os.path.getmtime(file_path)
+                    if file_mtime < min_mtime:
+                        log_debug(f"Skipping old file (mtime < target hour): {file_path}")
+                        continue
+                except Exception:
+                    pass
+
                 filename = os.path.basename(file_path)
                 base_name, _ = os.path.splitext(filename)
 
-                log_info(f"Extracting logs from {file_path} for logsource {logsource}...")
+                log_debug(f"Scanning candidate log file {file_path} for logsource {logsource}...")
                 extracted_lines = extract_logs_for_target_hour(file_path, start_time, end_time)
                 stage_extracted_content(base_name, logsource, extracted_lines)
 
-    # Check for any leftover/pre-existing files in STAGING_DIR
+    # Check for leftover staged files
     existing_staged_files = [os.path.join(STAGING_DIR, f) for f in os.listdir(STAGING_DIR)]
     existing_staged_files = [f for f in existing_staged_files if os.path.isfile(f)]
     for f in existing_staged_files:
@@ -248,8 +249,6 @@ def main():
             if not os.path.exists(file_path):
                 continue
             filename = os.path.basename(file_path)
-
-            # S3 URI: s3://<bucket>/logs/<hostname>/<logsource>/<filename>
             s3_uri = f"s3://{BUCKET_NAME}/logs/{SERVER_NAME}/{logsource}/{filename}"
 
             log_info(f"Uploading {filename} to {s3_uri}")
@@ -261,7 +260,7 @@ def main():
                 except Exception as e:
                     log_error(f"Failed to remove local staged file {filename}: {e}")
             else:
-                log_error(f"Failed to upload {filename} to S3. Retaining local staged copy for retry. Error: {upload_res.stderr}")
+                log_error(f"Failed to upload {filename} to S3. Retaining local staged file for retry. Error: {upload_res.stderr}")
 
     log_info("Hourly log extraction and S3 upload process complete.")
 

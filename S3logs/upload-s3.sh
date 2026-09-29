@@ -70,6 +70,10 @@ fi
 TARGET_YEAR="$(date -d '1 hour ago' +'%Y')"
 TARGET_TAG="$(date -d '1 hour ago' +'%Y-%m-%d-%H')"
 
+# Calculate minimum mtime timestamp in epoch seconds (target hour start minus 5 min buffer)
+MIN_MTIME_EPOCH="$(date -d '1 hour ago' +'%Y-%m-%d %H:00:00')"
+MIN_MTIME_SEC="$(date -d "$MIN_MTIME_EPOCH - 5 minutes" +%s)"
+
 log_info "Target extraction hour tag: ${TARGET_TAG}"
 
 # Embedded AWK extractor script (POSIX AWK compatible)
@@ -87,7 +91,7 @@ function parse_dt(line,   mon, day, idx, str) {
         gsub(/^[ \t]*\[?/, "", line);
         return substr(line, 1, 4) "-" substr(line, 6, 2) "-" substr(line, 9, 2) "-" substr(line, 12, 2);
     }
-    # 2) Nginx: [30/Mar/2026:14:05:01 +0000] or [29/Sep/2026:13:07:13 +0000]
+    # 2) Nginx: [30/Mar/2026:14:05:01 +0000]
     if (line ~ /\[[0-9]{2}\/[A-Za-z]{3}\/[0-9]{4}:[0-9]{2}:[0-9]{2}:[0-9]{2}/) {
         idx = index(line, "[");
         str = substr(line, idx + 1);
@@ -143,17 +147,32 @@ process_source() {
         local files=($pattern)
         shopt -u nullglob
 
-        log_debug "Pattern '$pattern' matched ${#files[@]} files."
-
         for file_path in "${files[@]}"; do
             [ -f "$file_path" ] || continue
+
+            # Skip compressed or temporary extensions
+            case "$file_path" in
+                *.gz|*.bz2|*.xz|*.zip|*.tar|*tmp|*TMP|*.swp)
+                    log_debug "Skipping compressed/temp file: $file_path"
+                    continue
+                    ;;
+            esac
+
+            # Filter by file modification time
+            local file_mtime_sec
+            file_mtime_sec="$(date -r "$file_path" +%s 2>/dev/null || echo 0)"
+            if [ "$file_mtime_sec" -lt "$MIN_MTIME_SEC" ]; then
+                log_debug "Skipping old file (mtime < target hour): $file_path"
+                continue
+            fi
+
             local filename
             filename="$(basename "$file_path")"
             local base_name="${filename%.*}"
             local target_filename="${base_name}-${TARGET_TAG}.log"
             local dest_path="${STAGING_DIR}/${target_filename}"
 
-            log_info "Extracting logs from ${file_path} for logsource ${logsource}..."
+            log_debug "Scanning candidate log file ${file_path} for logsource ${logsource}..."
 
             local tmp_out
             tmp_out="$(mktemp "${STAGING_DIR}/tmp.XXXXXX")"
@@ -166,7 +185,6 @@ process_source() {
                 log_info "Staged extracted logs [${logsource}]: ${target_filename}"
                 rm -f "$tmp_out"
             else
-                log_debug "No matching lines extracted from ${file_path}."
                 rm -f "$tmp_out"
             fi
         done
@@ -197,7 +215,6 @@ log_info "Starting uploads from ${STAGING_DIR} to S3 bucket ${BUCKET_NAME}..."
 if [ ! -f "$STAGED_MANIFEST" ] || [ ! -s "$STAGED_MANIFEST" ]; then
     log_info "No files staged for S3 upload."
 else
-    # Read unique staged items from manifest
     sort -u "$STAGED_MANIFEST" | while IFS='|' read -r file_path logsource; do
         [ -f "$file_path" ] || continue
         filename="$(basename "$file_path")"
