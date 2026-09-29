@@ -8,9 +8,9 @@
     notifempty
     nocreate
     nocompress
-    # Use custom date format with SCETMP to identify newly rotated logs before copying/renaming them
+    # Use standard date format for hourly rotated logs
     dateext
-    dateformat -SCETMP-%Y-%m-%d-%H
+    dateformat -%Y-%m-%d-%H
     
     # Send HUP signal to rsyslog so it closes current descriptors and writes to the newly created files
     sharedscripts
@@ -28,7 +28,7 @@
     nocreate
     nocompress
     dateext
-    dateformat -SCETMP-%Y-%m-%d-%H
+    dateformat -%Y-%m-%d-%H
     create 0640 root adm
     
     postrotate
@@ -45,7 +45,7 @@
     nocreate
     nocompress
     dateext
-    dateformat -SCETMP-%Y-%m-%d-%H
+    dateformat -%Y-%m-%d-%H
     create 0644 root root
     
     postrotate

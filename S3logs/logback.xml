@@ -7,10 +7,10 @@
             <level>INFO</level>
         </filter>
         <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <!-- rollover daily -->
-            <FileNamePattern>../logs/ampacimon-%d{yyyy-MM-dd}.log</FileNamePattern>
-            <!-- keep 3 days' worth of history -->
-            <maxHistory>3</maxHistory>
+            <!-- rollover hourly -->
+            <FileNamePattern>../logs/ampacimon-%d{yyyy-MM-dd-HH}.log</FileNamePattern>
+            <!-- keep 168 hours (7 days) of history -->
+            <maxHistory>168</maxHistory>
         </rollingPolicy>
         <encoder>
             <pattern>%date [%thread] %-5level %logger{36} [COR:%X{CORRELATION_ID_KEY}] %X{COMPONENT_TYPE_KEY}%X{USER_KEY}%X{HOST_KEY}[LID:%X{LINE_ID_KEY}] [MID:%X{AMPACIMON_ID_KEY}] %X{USER_ID}- %msg%n</pattern>
@@ -40,8 +40,8 @@
             <level>DEBUG</level>
         </filter>
         <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <FileNamePattern>../logs/ampacimon-debug-%d{yyyy-MM-dd}.log.zip</FileNamePattern>
-            <maxHistory>1</maxHistory>
+            <FileNamePattern>../logs/ampacimon-debug-%d{yyyy-MM-dd-HH}.log.zip</FileNamePattern>
+            <maxHistory>168</maxHistory>
         </rollingPolicy>
         <encoder>
             <pattern>%date [%thread] %-5level %logger{36} [COR:%X{CORRELATION_ID_KEY}] %X{COMPONENT_TYPE_KEY}%X{USER_KEY}%X{HOST_KEY}[LID:%X{LINE_ID_KEY}] [MID:%X{AMPACIMON_ID_KEY}] - %msg%n</pattern>
@@ -54,9 +54,9 @@
             <level>INFO</level>
         </filter>
         <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <!-- rollover daily -->
-            <FileNamePattern>../logs/ampacimon-apx-files-%d{yyyy-MM-dd}.log.zip</FileNamePattern>
-            <maxHistory>1</maxHistory>
+            <!-- rollover hourly -->
+            <FileNamePattern>../logs/ampacimon-apx-files-%d{yyyy-MM-dd-HH}.log.zip</FileNamePattern>
+            <maxHistory>168</maxHistory>
         </rollingPolicy>
         <encoder>
             <pattern>%date %-5level [MID:%X{AMPACIMON_ID_KEY}] - %msg%n</pattern>
@@ -87,8 +87,8 @@
             <level>DEBUG</level>
         </filter>
         <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <FileNamePattern>../logs/ampacimon-audit-%d{yyyy-MM-dd}.log</FileNamePattern>
-            <maxHistory>30</maxHistory>
+            <FileNamePattern>../logs/ampacimon-audit-%d{yyyy-MM-dd-HH}.log</FileNamePattern>
+            <maxHistory>168</maxHistory>
         </rollingPolicy>
         <encoder>
             <pattern>%date %-5level %logger{36} [COR:%X{CORRELATION_ID_KEY}] %X{COMPONENT_TYPE_KEY}[MID:%X{AMPACIMON_ID_KEY}] - %msg%n</pattern>
