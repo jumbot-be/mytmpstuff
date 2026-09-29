@@ -1,430 +1,57 @@
+# KISS Log Rotation - Hourly to S3: Deployment & Architecture Guide
 
-1. critique.md (Analysis & Critique Document)
-
-# KISS Log Rotation - Hourly to S3: Analysis and Critique
-
-This document provides an in-depth analysis and critique of the proposed hourly log rotation and S3 upload plan. It highlights critical security risks, operational bugs, and architectural concerns, and provides robust recommendations for resolving them.
+This document provides the deployment instructions, architecture notes, and system integration steps for the hourly log rotation and Amazon S3 upload process.
 
 ---
 
-## Executive Summary
+## 1. System Conffiles & Avoiding Daily vs. Hourly Conflicts
 
-While the proposed "KISS (Keep It Simple, Stupid)" approach is straightforward, the plan contains several **critical operational bugs and security vulnerabilities** that would lead to:
-1. **Data Loss / Missing Logs**: Due to missing service HUPs/reloads during rotation and deletion of staging logs even if AWS S3 uploads fail.
-2. **Security Exposure**: Due to using `/tmp/upload-s3` with weak permissions (`755`), allowing any unprivileged user on the server to read or manipulate sensitive system and audit logs.
-3. **Execution Bugs**: The cron syntax `* * * * *` will trigger the script **every single minute** instead of hourly, and logrotate running on default system logs hourly will conflict with the default daily logrotate status file.
-4. **Data Overwrites**: Multiple EC2 instances would write to the same S3 prefix without hostname partitioning, causing them to overwrite each other's logs.
+To prevent conflicts between standard daily log rotation (e.g. `/etc/logrotate.d/rsyslog` or `/etc/logrotate.d/nginx`) and the hourly rotation required for S3 upload:
 
----
+1. **Standard `conffile` Customization:**
+   Debian/Ubuntu package managers treat files under `/etc/logrotate.d/` as `conffiles`. By directly updating `/etc/logrotate.d/rsyslog` and `/etc/logrotate.d/nginx` with hourly rotation directives (`hourly`, `dateext`, `dateformat -%Y-%m-%d-%H`), package updates via `apt upgrade` will preserve your custom configuration instead of overwriting it.
 
-## Detailed Critique & Risks
-
-### 1. Security & Permission Vulnerabilities
-
-#### The Issue
-The plan stages rotated logs in `/tmp/upload-s3` and sets permissions to `755`.
-* **Shared Space Risks**: `/tmp` is accessible to all local users. Placing sensitive system logs (like `auth.log`, which containing login attempts, usernames, and potentially mistyped passwords) in `/tmp` violates the Principle of Least Privilege.
-* **Symlink & Tampering Attacks**: Unprivileged users or compromised system processes could inspect files, create symlinks, or inject malicious content into the staging files before they are uploaded to S3.
-* **Permissions (`755`)**: This permission allows any local user to read the contents of the staged logs.
-
-#### The Recommendation
-* Use a secure, dedicated directory such as `/var/spool/s3-upload` or `/var/lib/s3-upload`.
-* Restrict permissions to `700` (`drwx------`) and ensure it is owned strictly by `root:root`.
+2. **Unified Logrotate Invocation:**
+   The `upload-s3.py` script calls `logrotate /etc/logrotate.d/s3-hourly-logs` using the standard system logrotate status file (`/var/lib/logrotate/status`), eliminating state file divergence or collisions.
 
 ---
 
-### 2. Service Integration & Writing to Closed File Descriptors (Critical Bug)
+## 2. System Cron Setup
 
-#### The Issue
-When logrotate renames/rotates files like `/var/log/syslog` to `/var/log/syslog-SCETMP-...`, the active writer (`rsyslogd` or `systemd-journald`) retains the open file descriptor pointing to the *inode of the rotated file*. 
-* Because there is no `postrotate` block in the config to reload or signal the syslog daemon (e.g., `systemctl kill -s HUP rsyslog` or similar), the daemons will continue writing new log entries directly to the rotated/historic log file, rather than starting to write to the newly created `/var/log/syslog`.
-* This defeats the purpose of the hourly rotation, as the active/current log file will remain empty, and older logs will keep growing.
+The `upload-s3.py` script should be executed on an hourly schedule.
 
-#### The Recommendation
-* Add a `postrotate` script block in the logrotate configuration to send a `HUP` signal to `rsyslog` or trigger service reloads.
-  ```text
-  postrotate
-      /usr/lib/rsyslog/rsyslog-rotate
-  endscript
+Deploy a cron job under `/etc/cron.d/upload-s3`:
 
-3. State Tracking Conflicts (Logrotate State)
-The Issue
+```cron
+# Run the S3 log upload script every hour at minute 0
+0 * * * * root /usr/local/bin/upload-s3.py > /dev/null 2>&1
+```
 
-Running logrotate every hour on standard system log files (syslog, auth.log, etc.) using the default state file (/var/lib/logrotate/status) can conflict with Ubuntu's daily logrotate system cron/timer.
+Or place/symlink the script into `/etc/cron.hourly/upload-s3`:
 
-    This can cause daily rotations to skip, or create duplicate empty rotations, and throw off rotation counts (rotate 168).
-
-The Recommendation
-
-    Use a dedicated, separate state file for this hourly routine by calling logrotate with the -s flag: logrotate -s /var/lib/logrotate/hourly-status /etc/logrotate.d/hourly/all-logs
-
-4. Cron Execution Frequency Error
-The Issue
-
-The plan specifies:
-
-* * * * * /opt/upload-s3
-
-    The wildcard * in the first position (minutes) causes the cron job to trigger every single minute. This would overload the CPU and make unnecessary API requests to AWS S3, while the files are only rotated hourly.
-
-The Recommendation
-
-    Change the cron expression to run once an hour (at minute 0):
-
-    0 * * * * /opt/upload-s3
-
-    Alternatively, simply place the script in /etc/cron.hourly/upload-s3 (and remove the crontab entry), as it is automatically executed hourly by the system's cron daemon.
-
-5. Data Loss risk on S3 Upload Failures
-The Issue
-
-The upload script states: "Clears /tmp/upload-s3/ after upload".
-
-    If the script runs a blind clean operation in the staging directory after the aws s3 sync/cp command, any network timeout, IAM credential expiry, or AWS API limit error will cause the logs to be permanently deleted before they are successfully backed up to S3.
-
-The Recommendation
-
-    Only delete a file from the local staging area if the upload command for that specific file (or batch) succeeded with a successful transfer confirmation.
-    Use a safe file-by-file verification process or a verified transfer operation which deletes files locally only after successful transfer.
-
-6. Race Conditions during Rotated File Copying
-The Issue
-
-The logrotate postrotate copying process:
-
-    "postrotate copies only files matching -SCEYYYY-MM-DD-HH pattern to /tmp/upload-s3 than rename them in their initial folder to avoid useless synchronisation"
-    The postrotate script is run once for the entire configuration, not per file, which makes dynamic renaming error-prone and fragile.
-    Renaming the rotated files in /var/log after copying them will break logrotate's built-in cleanup mechanism (rotate 168), meaning old files will accumulate in /var/log indefinitely.
-
-The Recommendation
-
-    Let logrotate do its job cleanly (storing rotated logs in /var/log with normal names, or using the olddir directive to place them directly in /var/spool/s3-upload/ during rotation).
-    Alternatively, have the hourly upload-s3 script identify completed rotated files (e.g. looking for syslog-SCETMP-*), move them securely to the staging folder, upload them, and then delete them or store them in a local archive directory.
-
-7. S3 Path Overwrite Conflicts across Multiple Servers
-The Issue
-
-The plan uploads directly to s3://sdt-be-adr-dev-audit-logs/logs/.
-
-    If you deploy this plan to multiple EC2 instances, they will all try to upload syslog-SCETMP-2026-08-12-14 to the same folder, overwriting each other's audit trails.
-
-The Recommendation
-
-    Dynamically retrieve the instance's hostname or EC2 Instance ID.
-    Partition the S3 destination path as requested: s3://<bucket-name>/logs/<hostname>/<logsource>/.
-        For example, /var/log/syslog rotated file goes to s3://sdt-be-adr-dev-audit-logs/logs/instance-01/syslog/syslog-2026-08-12-14.
-
-8. Logging, Monitoring, and Error Handling
-The Issue
-
-The Troubleshooting section suggests checking upload logs using tail -f /var/log/syslog filtered for upload-s3, but the proposed upload-s3 script does not redirect or log its output anywhere.
-
-    Silent failures are extremely dangerous for audit and security logs.
-
-The Recommendation
-
-    Integrate logging mechanisms into the upload-s3 script so that all key lifecycle events (start, success, failure counts, AWS CLI errors) are logged directly to syslog under the upload-s3 tag.
-
-Comparative Summary Table
-Feature 	Proposed Plan 	Our Improved Implementation 	Why it matters
-Staging Directory 	/tmp/upload-s3 	/var/spool/s3-upload 	Prevents local privilege escalation & symlink attacks.
-Staging Directory Perms 	755 	700 (root-only) 	Keeps sensitive system logs hidden from non-root users.
-Cron Scheduling 	* * * * * (Every minute) 	0 * * * * (Every hour) 	Prevents waste of system resources and API limits.
-Logrotate State 	Default (/var/lib/logrotate/status) 	Dedicated (/var/lib/logrotate/hourly-status) 	Avoids collision with default daily system logrotate execution.
-Writer Daemon Reload 	Missing 	Yes (rsyslog HUP signal) 	Prevents daemons from continuing to write to rotated files.
-S3 Directory Structure 	Flat (logs/file) 	Partitioned (logs/hostname/source/file) 	Prevents logs from multiple EC2 instances from overwriting each other.
-Data Safety 	Blind delete after upload 	Delete only on verified success 	Guarantees logs are not lost due to network or API failures.
-Troubleshooting / Logs 	Missing 	Integrated with logger 	Allows monitoring and alert triggering on upload failures.
-
-
----
-
-### 2. `scripts/upload-s3` (Robust Upload and Helper Script)
-```python
-#!/usr/bin/env python3
-# KISS Log Rotation & S3 Upload Script
-# Designed for robust, secure, and automated hourly log handling.
-# Resolves security risks (uses secure staging), race conditions, and prevents data loss.
-
-import os
-import sys
-import subprocess
-import glob
-import shutil
-import socket
-from datetime import datetime
-
-# 1. Configuration
-# Default bucket name; can be overridden via environment variable S3_LOG_BUCKET
-BUCKET_NAME = os.environ.get("S3_LOG_BUCKET", "sdt-be-adr-dev-audit-logs")
-STAGING_DIR = "/var/spool/s3-upload"
-LOG_DIR = "/var/log"
-PAYARA_LOG_DIR = "/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs"
-
-# Dynamically retrieve server name
-try:
-    SERVER_NAME = socket.gethostname()
-except Exception:
-    SERVER_NAME = "unknown-host"
-
-# 2. Logging Helpers
-def log_info(msg):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] INFO: {msg}")
-    subprocess.run(["logger", "-t", "upload-s3", f"INFO: {msg}"], check=False)
-
-def log_error(msg):
-    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    print(f"[{timestamp}] ERROR: {msg}", file=sys.stderr)
-    subprocess.run(["logger", "-t", "upload-s3", f"ERROR: {msg}"], check=False)
-
-log_info(f"Starting hourly S3 log upload process on {SERVER_NAME}.")
-
-# 3. Environment Checks & Staging Area Setup
-if not shutil.which("aws"):
-    log_error("AWS CLI (aws) is not installed or not in PATH. Aborting.")
-    sys.exit(1)
-
-# Ensure secure staging directory exists with root-only permissions (700)
-if not os.path.exists(STAGING_DIR):
-    os.makedirs(STAGING_DIR, mode=0o700)
-    log_info(f"Created secure staging directory at {STAGING_DIR} with 700 permissions.")
-else:
-    os.chmod(STAGING_DIR, 0o700)
-
-# 4. Trigger Logrotate
-# Using dedicated status file to prevent conflicts with daily/system logrotate
-log_info("Triggering logrotate with hourly configuration...")
-res = subprocess.run(["logrotate", "-s", "/var/lib/logrotate/hourly-status", "/etc/logrotate.d/hourly/all-logs"], capture_output=True, text=True)
-if res.returncode == 0:
-    log_info("Logrotate successfully ran.")
-else:
-    log_error(f"Logrotate encountered errors, but continuing to process staged/rotated files. Error: {res.stderr}")
-
-# 5. Locate & Stage System Logs (syslog, auth.log, kern.log)
-# System logs rotated hourly are formatted with SCETMP-%Y-%m-%d-%H
-# We look for files matching *-SCETMP-*
-log_info(f"Scanning for newly rotated system logs in {LOG_DIR}...")
-for file_path in glob.glob(os.path.join(LOG_DIR, "*-SCETMP-*")):
-    if os.path.isfile(file_path):
-        filename = os.path.basename(file_path)
-        # Extract base log name (e.g., syslog)
-        logsource = filename.split("-SCETMP-")[0]
-        # Create target filename with SCE instead of SCETMP
-        target_filename = filename.replace("-SCETMP-", "-SCE-")
-        
-        log_info(f"Staging system log: {filename} -> {target_filename}")
-        try:
-            shutil.copy(file_path, os.path.join(STAGING_DIR, target_filename))
-            os.rename(file_path, os.path.join(LOG_DIR, target_filename))
-        except Exception as e:
-            log_error(f"Failed to stage system log file: {filename}. Error: {e}")
-
-# 6. Locate & Stage Payara / Logback Logs
-# Payara active logs are apcm.log, apcm-debug.log, apcm.logs, apcm-debug.logs
-# We process already rotated logs (which contain rotation/date suffixes)
-if os.path.exists(PAYARA_LOG_DIR):
-    log_info(f"Scanning for rotated Payara logs in {PAYARA_LOG_DIR}...")
-    for file_path in glob.glob(os.path.join(PAYARA_LOG_DIR, "apcm*")):
-        if os.path.isfile(file_path):
-            filename = os.path.basename(file_path)
-            
-            # Skip active logs
-            if filename in ["apcm.log", "apcm-debug.log", "apcm.logs", "apcm-debug.logs"]:
-                continue
-            
-            # Skip already processed logs
-            if filename.endswith(".uploaded"):
-                continue
-            
-            log_info(f"Staging Payara log: {filename}")
-            try:
-                shutil.copy(file_path, os.path.join(STAGING_DIR, filename))
-                os.rename(file_path, file_path + ".uploaded")
-            except Exception as e:
-                log_error(f"Failed to stage Payara log file: {filename}. Error: {e}")
-else:
-    log_info(f"Payara log directory {PAYARA_LOG_DIR} does not exist. Skipping Payara log scanning.")
-
-# 7. Upload Staged Files to S3
-# We upload files individually and delete them locally ONLY if upload succeeds
-log_info(f"Starting uploads from {STAGING_DIR} to S3 bucket {BUCKET_NAME}...")
-staged_files = [os.path.join(STAGING_DIR, f) for f in os.listdir(STAGING_DIR)]
-staged_files = [f for f in staged_files if os.path.isfile(f)]
-
-if not staged_files:
-    log_info("No files staged for S3 upload.")
-else:
-    for file_path in staged_files:
-        filename = os.path.basename(file_path)
-        
-        # Determine correct S3 logsource category
-        if "-SCE-" in filename:
-            logsource = filename.split("-SCE-")[0]
-        elif filename.startswith("apcm-debug"):
-            logsource = "apcm-debug"
-        elif filename.startswith("apcm"):
-            logsource = "apcm"
-        else:
-            logsource = "general"
-        
-        # Construct destination S3 URI: logs/$Servername/$logsource/filename
-        s3_uri = f"s3://{BUCKET_NAME}/logs/{SERVER_NAME}/{logsource}/{filename}"
-        
-        log_info(f"Uploading {filename} to {s3_uri}")
-        upload_res = subprocess.run(["aws", "s3", "cp", file_path, s3_uri], capture_output=True, text=True)
-        if upload_res.returncode == 0:
-            log_info(f"Successfully uploaded {filename}. Removing local staged copy.")
-            try:
-                os.remove(file_path)
-            except Exception as e:
-                log_error(f"Failed to remove local staged file {filename}: {e}")
-        else:
-            log_error(f"Failed to upload {filename} to S3. Retaining local staged file for retry. Error: {upload_res.stderr}")
-
-# 8. Local Retention Cleanup (Delete logs older than 7 days)
-log_info("Running local retention cleanup for historical logs...")
-
-now_ts = datetime.now().timestamp()
-seven_days_sec = 7 * 24 * 60 * 60
-
-# Clean up processed system logs in LOG_DIR older than 7 days
-for file_path in glob.glob(os.path.join(LOG_DIR, "*-SCE-*")):
-    try:
-        if os.path.isfile(file_path) and (now_ts - os.path.getmtime(file_path)) > seven_days_sec:
-            os.remove(file_path)
-    except Exception:
-        pass
-
-# Clean up processed Payara logs older than 7 days
-if os.path.exists(PAYARA_LOG_DIR):
-    for file_path in glob.glob(os.path.join(PAYARA_LOG_DIR, "*.uploaded")):
-        try:
-            if os.path.isfile(file_path) and (now_ts - os.path.getmtime(file_path)) > seven_days_sec:
-                os.remove(file_path)
-        except Exception:
-            pass
-
-log_info("KISS hourly log rotation and S3 upload process complete.")
-
-3. scripts/all-logs (Logrotate Config)
-
-# Hourly Logrotate configuration for specific system logs (syslog, auth.log, kern.log)
-# Supported by the hourly upload-s3 cron job.
-
-/var/log/syslog
-/var/log/auth.log
-/var/log/kern.log
-{
-    hourly
-    missingok
-    rotate 168
-    notifempty
-    nocreate
-    nocompress
-    # Use custom date format with SCETMP to identify newly rotated logs before copying/renaming them
-    dateext
-    dateformat -SCETMP-%Y-%m-%d-%H
-    
-    # Send HUP signal to rsyslog so it closes current descriptors and writes to the newly created files
-    sharedscripts
-    postrotate
-        /usr/lib/rsyslog/rsyslog-rotate || systemctl kill -s HUP rsyslog || true
-    endscript
-}
-
-4. scripts/logback.xml (Payara/Logback Config)
-
-<?xml version="1.0" encoding="UTF-8"?>
-<configuration scan="true" scanPeriod="30 seconds">
-
-    <!-- Directory for application logs -->
-    <property name="LOG_DIR" value="/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs" />
-
-    <!-- 1. Console Appender (for Keycloak / Payara standard out) -->
-    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
-        </encoder>
-    </appender>
-
-    <!-- 2. Rolling File Appender for APCM Core Logs -->
-    <appender name="APCM_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>${LOG_DIR}/apcm.logs</file>
-        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <!-- Hourly rollover -->
-            <fileNamePattern>${LOG_DIR}/apcm-%d{yyyy-MM-dd-HH}.logs</fileNamePattern>
-            <!-- Keep 168 hours (7 days) of history -->
-            <maxHistory>168</maxHistory>
-        </rollingPolicy>
-        <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
-        </encoder>
-    </appender>
-
-    <!-- 3. Rolling File Appender for APCM Debug Logs -->
-    <appender name="APCM_DEBUG_FILE" class="ch.qos.logback.core.rolling.RollingFileAppender">
-        <file>${LOG_DIR}/apcm-debug.logs</file>
-        <rollingPolicy class="ch.qos.logback.core.rolling.TimeBasedRollingPolicy">
-            <!-- Hourly rollover -->
-            <fileNamePattern>${LOG_DIR}/apcm-debug-%d{yyyy-MM-dd-HH}.logs</fileNamePattern>
-            <!-- Keep 168 hours (7 days) of history -->
-            <maxHistory>168</maxHistory>
-        </rollingPolicy>
-        <encoder>
-            <pattern>%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n</pattern>
-        </encoder>
-    </appender>
-
-    <!-- Application log levels -->
-    <root level="INFO">
-        <appender-ref ref="CONSOLE" />
-        <appender-ref ref="APCM_FILE" />
-    </root>
-
-    <logger name="com.ampacimon" level="DEBUG" additivity="false">
-        <appender-ref ref="CONSOLE" />
-        <appender-ref ref="APCM_FILE" />
-        <appender-ref ref="APCM_DEBUG_FILE" />
-    </logger>
-
-</configuration>
-
-5. scripts/additional_config.md (Integration & Deployment Steps)
-
-# Instructions and configuration snippets for additional components
-
-## 1. Keycloak Configuration
-To send Keycloak logs to syslog (so they are aggregated into `/var/log/syslog` and rotated hourly), modify `/opt/keycloak/conf/keycloak.conf` to append `syslog`:
-
-```properties
-# Add syslog to log handlers
-log=console,file,syslog
-
-2. systemd-journald Forwarding to Syslog (for rsyslog integration)
-
-To ensure systemd service logs (such as Payara running under a systemd unit or other services) are properly forwarded to syslog for rsyslog to capture:
-
-Edit /etc/systemd/journald.conf:
-
-[Journal]
-# Ensure journal logs are forwarded to syslog
-ForwardToSyslog=yes
-
-After modifying, restart journald:
-
-sudo systemctl restart systemd-journald
-
-3. Hourly Cron / Trigger Deployment
-
-Instead of using a wildcard cron rule that runs every minute, deploy the script to run strictly on the hour.
-
-You can configure this by placing a cron file under /etc/cron.d/upload-s3:
-
-# Run the upload script every hour on the hour as root
-0 * * * * root /opt/upload-s3
-
-Alternatively, symlink or copy the script directly to /etc/cron.hourly/:
-
-sudo cp scripts/upload-s3 /etc/cron.hourly/upload-s3
+```bash
+sudo cp S3logs/upload-s3.py /etc/cron.hourly/upload-s3
 sudo chmod +x /etc/cron.hourly/upload-s3
+```
+
+---
+
+## 3. Monitored Log Directories & S3 Destination Mapping
+
+The script monitors the following directories and uploads newly rotated files (modified within the last 3600 seconds) to S3 under `s3://<bucket>/logs/<hostname>/<logsource>/<filename>`:
+
+| Log Type | Source Directory | Selection Pattern | S3 Logsource Category |
+| :--- | :--- | :--- | :--- |
+| **System Logs** | `/var/log/` | `syslog-*`, `auth.log-*`, `kern.log-*` | `syslog`, `auth.log`, `kern.log` |
+| **Nginx Logs** | `/var/log/nginx/` | `*.log-*` | `nginx` |
+| **CrushFTP Logs** | `/opt/CrushFTP11/` | `*.log-*` | `crushftp` |
+| **Keycloak Logs** | `/opt/adr/apcm-keycloak-bundle-rh/keycloak/data/log/` | `*` (except active `keycloak.log`) | `keycloak` |
+| **Payara / ADR Logs** | `/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampacimon-domain/logs/` | `*` (except active `.log` files) | `ADR` |
+
+---
+
+## 4. Safety & Retention Principles
+
+- **No Renaming of Original Logs:** Original rotated logs remain untouched in their source directories to allow standard retention (`rotate 168` / Logback `maxHistory 168`) to manage local cleanup automatically.
+- **Secure Staging Area:** Files are copied to `/var/spool/s3-upload` with `0700` (`root:root`) permissions before upload.
+- **Data Protection:** Staged files are removed from local staging **only** after the `aws s3 cp` command returns exit code `0` (success). If an upload fails, the staged file is retained for retry during subsequent runs.

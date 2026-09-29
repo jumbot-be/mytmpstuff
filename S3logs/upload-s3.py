@@ -62,9 +62,9 @@ else:
     os.chmod(STAGING_DIR, 0o700)
 
 # 4. Trigger Logrotate
-# Using dedicated status file to prevent conflicts with daily/system logrotate
+# Triggering logrotate using standard system status file
 log_info("Triggering logrotate with hourly configuration...")
-res = subprocess.run(["logrotate", "-s", "/var/lib/logrotate/hourly-status", "/etc/logrotate.d/s3-hourly-logs"], capture_output=True, text=True)
+res = subprocess.run(["logrotate", "/etc/logrotate.d/s3-hourly-logs"], capture_output=True, text=True)
 if res.returncode == 0:
     log_info("Logrotate successfully ran.")
 else:
