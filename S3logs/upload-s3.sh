@@ -3,14 +3,18 @@
 # Extracts logs for the previous full hour directly from log files based on timestamps
 # and uploads extracted log files to Amazon S3.
 
-set -eo pipefail
+set -uo pipefail
 
 # Parse CLI flags
 VERBOSE=0
+KEEP_STAGING=0
 for arg in "$@"; do
     case "$arg" in
         -v|--verbose)
             VERBOSE=1
+            ;;
+        -k|--keep-staging)
+            KEEP_STAGING=1
             ;;
     esac
 done
@@ -18,7 +22,17 @@ done
 # 1. Configuration
 BUCKET_NAME="${S3_LOG_BUCKET:-sdt-be-adr-dev-audit-logs}"
 STAGING_DIR="/var/spool/s3-upload"
+LOCK_FILE="/var/lock/upload-s3.lock"
+UPLOAD_TIMEOUT_SEC="${UPLOAD_TIMEOUT_SEC:-900}"
 SERVER_NAME="$(hostname 2>/dev/null || echo "unknown-host")"
+
+# Prevent concurrent executions (hourly cron overlap / hung uploads)
+mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+    echo "[ERROR] Another upload-s3 instance is already running. Aborting." >&2
+    exit 1
+fi
 
 # 2. Logging Helpers
 log_info() {
@@ -212,24 +226,49 @@ process_source "ADR" "/opt/adr/apcm-payara-bundle/payara5/glassfish/domains/ampa
 # Upload Staged Files to S3
 log_info "Starting uploads from ${STAGING_DIR} to S3 bucket ${BUCKET_NAME}..."
 
+FAILURES=0
 if [ ! -f "$STAGED_MANIFEST" ] || [ ! -s "$STAGED_MANIFEST" ]; then
     log_info "No files staged for S3 upload."
 else
-    sort -u "$STAGED_MANIFEST" | while IFS='|' read -r file_path logsource; do
+    REMAINING_MANIFEST="${STAGING_DIR}/.staged_manifest.remaining"
+    : > "$REMAINING_MANIFEST"
+    while IFS='|' read -r file_path logsource; do
         [ -f "$file_path" ] || continue
         filename="$(basename "$file_path")"
 
         s3_uri="s3://${BUCKET_NAME}/logs/${SERVER_NAME}/${logsource}/${filename}"
         log_info "Uploading ${filename} to ${s3_uri}"
 
-        if aws s3 cp "$file_path" "$s3_uri"; then
-            log_info "Successfully uploaded ${filename}. Removing local staged copy."
-            rm -f "$file_path"
+        if timeout "$UPLOAD_TIMEOUT_SEC" aws s3 cp "$file_path" "$s3_uri"; then
+            log_info "Successfully uploaded ${filename}."
+            if [ "$KEEP_STAGING" -eq 1 ]; then
+                log_info "Keeping local staged copy of ${filename} (--keep-staging)."
+            else
+                if ! rm -f "$file_path"; then
+                    log_error "Failed to remove local staged file ${filename}."
+                    FAILURES=$((FAILURES + 1))
+                fi
+            fi
         else
             log_error "Failed to upload ${filename} to S3. Retaining local staged file for retry."
+            echo "${file_path}|${logsource}" >> "$REMAINING_MANIFEST"
+            FAILURES=$((FAILURES + 1))
         fi
-    done
-    rm -f "$STAGED_MANIFEST"
+    done < <(sort -u "$STAGED_MANIFEST")
+
+    if [ -s "$REMAINING_MANIFEST" ]; then
+        mv -f "$REMAINING_MANIFEST" "$STAGED_MANIFEST"
+        log_error "${FAILURES} upload(s) failed; staged files retained for retry on next run."
+    else
+        rm -f "$REMAINING_MANIFEST" "$STAGED_MANIFEST"
+    fi
 fi
 
+# Clean up abandoned extraction temp files older than 1 day
+find "$STAGING_DIR" -maxdepth 1 -name 'tmp.*' -type f -mmin +1440 -exec rm -f {} + 2>/dev/null || true
+
 log_info "Hourly log extraction and S3 upload process complete (Bash/AWK)."
+
+if [ "$FAILURES" -gt 0 ]; then
+    exit 1
+fi

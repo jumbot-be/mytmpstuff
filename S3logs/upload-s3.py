@@ -7,6 +7,7 @@ import os
 import sys
 import re
 import glob
+import fcntl
 import shutil
 import socket
 import argparse
@@ -19,6 +20,8 @@ VERBOSE = False
 # 1. Configuration
 BUCKET_NAME = os.environ.get("S3_LOG_BUCKET", "sdt-be-adr-dev-audit-logs")
 STAGING_DIR = "/var/spool/s3-upload"
+LOCK_FILE = "/var/lock/upload-s3.lock"
+UPLOAD_TIMEOUT_SEC = int(os.environ.get("UPLOAD_TIMEOUT_SEC", "900"))
 
 # Directories & Monitored Targets
 SOURCES_CONFIG = [
@@ -141,10 +144,18 @@ def main():
     global VERBOSE
     parser = argparse.ArgumentParser(description="Hourly S3 log extraction and upload script")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose / debug output")
+    parser.add_argument("-k", "--keep-staging", action="store_true", help="Keep local staged copies after successful S3 upload")
     args = parser.parse_args()
 
     if args.verbose:
         VERBOSE = True
+
+    lock_fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log_error("Another upload-s3 instance is already running. Aborting.")
+        sys.exit(1)
 
     log_info(f"Starting hourly S3 log extraction and upload process on {SERVER_NAME}.")
 
@@ -244,6 +255,7 @@ def main():
     # Upload Staged Files to S3
     log_info(f"Starting uploads from {STAGING_DIR} to S3 bucket {BUCKET_NAME}...")
 
+    failures = 0
     if not staged_items:
         log_info("No files staged for S3 upload.")
     else:
@@ -254,17 +266,30 @@ def main():
             s3_uri = f"s3://{BUCKET_NAME}/logs/{SERVER_NAME}/{logsource}/{filename}"
 
             log_info(f"Uploading {filename} to {s3_uri}")
-            upload_res = subprocess.run(["aws", "s3", "cp", file_path, s3_uri], capture_output=True, text=True)
+            try:
+                upload_res = subprocess.run(["aws", "s3", "cp", file_path, s3_uri], capture_output=True, text=True, timeout=UPLOAD_TIMEOUT_SEC)
+            except subprocess.TimeoutExpired:
+                log_error(f"Upload of {filename} timed out after {UPLOAD_TIMEOUT_SEC}s. Retaining local staged file for retry.")
+                failures += 1
+                continue
             if upload_res.returncode == 0:
-                log_info(f"Successfully uploaded {filename}. Removing local staged copy.")
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    log_error(f"Failed to remove local staged file {filename}: {e}")
+                log_info(f"Successfully uploaded {filename}.")
+                if args.keep_staging:
+                    log_info(f"Keeping local staged copy of {filename} (--keep-staging).")
+                else:
+                    try:
+                        os.remove(file_path)
+                    except Exception as e:
+                        log_error(f"Failed to remove local staged file {filename}: {e}")
             else:
                 log_error(f"Failed to upload {filename} to S3. Retaining local staged file for retry. Error: {upload_res.stderr}")
+                failures += 1
 
     log_info("Hourly log extraction and S3 upload process complete.")
+
+    if failures > 0:
+        log_error(f"{failures} upload(s) failed.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
