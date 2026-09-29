@@ -158,11 +158,13 @@ def main():
     else:
         os.chmod(STAGING_DIR, 0o700)
 
+    # Determine target hour window: the previous full clock hour
     now = datetime.now()
-    target_dt = now - timedelta(hours=1)
+    # If run at e.g. 14:19:56, target_dt is 13:00 (previous full clock hour)
+    target_dt = (now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
     target_hour_str = target_dt.strftime("%Y-%m-%d-%H")
 
-    start_time = target_dt.replace(minute=0, second=0, microsecond=0)
+    start_time = target_dt
     end_time = target_dt.replace(minute=59, second=59, microsecond=999999)
 
     log_info(f"Target extraction window: {start_time} to {end_time} (Hour tag: {target_hour_str})")
@@ -187,7 +189,8 @@ def main():
         except Exception as e:
             log_error(f"Failed to write staged log file: {target_filename}. Error: {e}")
 
-    min_mtime = start_time.timestamp() - 300  # allow 5 min buffer
+    # Candidate file mtime must be >= start_time - 300 seconds
+    min_mtime = start_time.timestamp() - 300
 
     for source in SOURCES_CONFIG:
         logsource = source["logsource"]

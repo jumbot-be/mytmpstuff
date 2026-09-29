@@ -66,12 +66,13 @@ else
     chmod 700 "$STAGING_DIR"
 fi
 
-# Calculate target extraction hour (the previous full hour)
-TARGET_YEAR="$(date -d '1 hour ago' +'%Y')"
-TARGET_TAG="$(date -d '1 hour ago' +'%Y-%m-%d-%H')"
+# Calculate target extraction hour (previous full clock hour)
+CURRENT_CLOCK_HOUR="$(date +'%Y-%m-%d %H:00:00')"
+TARGET_TAG="$(date -d "$CURRENT_CLOCK_HOUR - 1 hour" +'%Y-%m-%d-%H')"
+TARGET_YEAR="$(date -d "$CURRENT_CLOCK_HOUR - 1 hour" +'%Y')"
 
-# Calculate minimum mtime timestamp in epoch seconds (target hour start minus 5 min buffer)
-MIN_MTIME_EPOCH="$(date -d '1 hour ago' +'%Y-%m-%d %H:00:00')"
+# Minimum mtime in epoch seconds (target hour start minus 5 min buffer)
+MIN_MTIME_EPOCH="$(date -d "$CURRENT_CLOCK_HOUR - 1 hour" +'%Y-%m-%d %H:00:00')"
 MIN_MTIME_SEC="$(date -d "$MIN_MTIME_EPOCH - 5 minutes" +%s)"
 
 log_info "Target extraction hour tag: ${TARGET_TAG}"
